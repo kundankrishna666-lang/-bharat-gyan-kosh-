@@ -1,0 +1,172 @@
+mkdir -p /mnt/user-data/outputs/tools /mnt/user-data/outputs/.github/workflows && cd /mnt/user-data/outputs && cat > tools/verify_records.py <<'PY'
+#!/usr/bin/env python3
+"""सत्य भारत: साइट के रिकॉर्ड-लिंक की स्वचालित जाँच.
+
+क्या करता है:
+  1. index.html से सभी रिकॉर्ड-लिंक (url:"...") निकालता है.
+  2. हर लिंक का डोमेन भरोसेमंद सूची में है या नहीं, HTTPS है या नहीं, जाँचता है.
+  3. लिंक सच में खुलता है या नहीं (OK / WARN / FAIL) देखता है.
+  4. वैकल्पिक: --doi से किसी DOI का असली शीर्षक और वर्ष मँगाकर मिलाता है.
+  5. verification_report.md बनाता है. सिर्फ़ FAIL होने पर exit code 1.
+
+चलाना:
+  python tools/verify_records.py
+  python tools/verify_records.py --doi 10.5281/zenodo.1234567
+सिर्फ़ Python 3.8+ की standard library चाहिए.
+"""
+import argparse, json, re, socket, ssl, sys, urllib.error, urllib.request
+from datetime import date
+from pathlib import Path
+from urllib.parse import urlparse
+
+TRUSTED = ["gov.in", "nic.in", "ac.in", "edu.in", "zenodo.org", "rbi.org.in",
+           "pib.gov.in", "who.int", "un.org", "worldbank.org", "imf.org",
+           "nature.com", "science.org", "arxiv.org", "doi.org", "npci.org.in"]
+UA = {"User-Agent": "SatyaBharat-LinkCheck/1.0 (+https://github.com)"}
+
+
+def extract_urls(html: str):
+    """RECORDS में लिखे सभी url:"..." लिंक, बिना दोहराव के."""
+    seen, out = set(), []
+    for u in re.findall(r'url\s*:\s*"(https?://[^"]+)"', html):
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def trusted_domain(host: str):
+    host = host.lower()
+    return next((d for d in TRUSTED if host == d or host.endswith("." + d)), None)
+
+
+def fetch(url: str, method: str = "HEAD", timeout: int = 15):
+    req = urllib.request.Request(url, headers=UA, method=method)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def check_url(url: str):
+    """(स्थिति, कोड/कारण, अंतिम URL) लौटाता है."""
+    for method in ("HEAD", "GET"):
+        try:
+            with fetch(url, method) as r:
+                return "OK", r.status, r.geturl()
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 405, 429, 503) and method == "HEAD":
+                continue  # कई साइट्स HEAD/बॉट रोकती हैं, GET आज़माएँ
+            if e.code in (404, 410):
+                return "FAIL", e.code, url
+            return "WARN", e.code, url  # 403/429 आदि: बॉट-ब्लॉक हो सकता है
+        except (socket.timeout, TimeoutError):
+            return "WARN", "timeout", url
+        except ssl.SSLError as e:
+            return "WARN", f"ssl: {e.reason}", url
+        except urllib.error.URLError as e:
+            reason = str(e.reason)
+            if "Name or service not known" in reason or "getaddrinfo" in reason:
+                return "FAIL", "DNS नहीं मिला", url
+            return "WARN", reason[:60], url
+    return "WARN", "अज्ञात", url
+
+
+def check_doi(doi: str):
+    """DOI को doi.org से हल करके Zenodo/Crossref/DataCite से शीर्षक लाता है."""
+    doi = doi.strip().replace("https://doi.org/", "")
+    info = {"doi": doi, "resolves": False}
+    try:
+        with fetch(f"https://doi.org/api/handles/{doi}", "GET") as r:
+            info["resolves"] = json.load(r).get("responseCode") == 1
+    except Exception as e:
+        info["error"] = str(e)[:80]
+        return info
+    for api in (f"https://api.crossref.org/works/{doi}", f"https://api.datacite.org/dois/{doi}"):
+        try:
+            with fetch(api, "GET") as r:
+                d = json.load(r)
+            if "message" in d:  # Crossref
+                m = d["message"]
+                info["title"] = (m.get("title") or [""])[0]
+                info["year"] = (m.get("issued", {}).get("date-parts") or [[None]])[0][0]
+            else:  # DataCite (Zenodo इसी में आता है)
+                a = d["data"]["attributes"]
+                info["title"] = (a.get("titles") or [{}])[0].get("title", "")
+                info["year"] = a.get("publicationYear")
+            break
+        except Exception:
+            continue
+    return info
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--html", default="index.html")
+    ap.add_argument("--doi", action="append", default=[], help="जाँचने के लिए DOI (कई बार दे सकते हैं)")
+    ap.add_argument("--report", default="verification_report.md")
+    args = ap.parse_args()
+
+    html = Path(args.html).read_text(encoding="utf-8")
+    urls = extract_urls(html)
+    lines = [f"# सत्य भारत: सत्यापन रिपोर्ट ({date.today()})", "",
+             "| स्थिति | कोड | डोमेन | लिंक |", "|---|---|---|---|"]
+    fails = 0
+    for u in urls:
+        p = urlparse(u)
+        notes = []
+        if p.scheme != "https":
+            notes.append("HTTPS नहीं")
+        dom = trusted_domain(p.hostname or "")
+        if not dom:
+            notes.append("डोमेन भरोसेमंद सूची में नहीं")
+        status, code, final = check_url(u)
+        if status == "FAIL":
+            fails += 1
+        mark = {"OK": "✅", "WARN": "⚠", "FAIL": "❌"}[status]
+        extra = f" ({'; '.join(notes)})" if notes else ""
+        lines.append(f"| {mark} {status} | {code} | {dom or p.hostname}{extra} | {u} |")
+        print(f"{mark} {status:4} {code!s:>10}  {u}{extra}")
+
+    if args.doi:
+        lines += ["", "## DOI जाँच", "", "| DOI | खुलता है | शीर्षक | वर्ष |", "|---|---|---|---|"]
+        for d in args.doi:
+            i = check_doi(d)
+            ok = "✅" if i["resolves"] else "❌"
+            if not i["resolves"]:
+                fails += 1
+            lines.append(f"| {i['doi']} | {ok} | {i.get('title', '—')} | {i.get('year', '—')} |")
+            print(f"{ok} DOI {i['doi']} -> {i.get('title', i.get('error', '—'))}")
+
+    lines += ["", "> WARN का मतलब: साइट ने बॉट को रोका या धीमी थी। ब्राउज़र में खुद खोलकर देखें."]
+    Path(args.report).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"\nरिपोर्ट: {args.report} | FAIL: {fails}")
+    sys.exit(1 if fails else 0)
+
+
+if __name__ == "__main__":
+    main()
+PY
+cat > .github/workflows/link-check.yml <<'YML'
+name: link-check
+on:
+  schedule:
+    - cron: "0 3 * * 1"   # हर सोमवार
+  workflow_dispatch:
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python tools/verify_records.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: verification-report, path: verification_report.md }
+YML
+python3 -m py_compile tools/verify_records.py && echo COMPILED
+python3 - <<'PY'
+import sys; sys.path.insert(0,'tools')
+import verify_records as v
+u=v.extract_urls(open('index.html',encoding='utf-8').read())
+print(len(u),u[:3]); print(v.trusted_domain("www.isro.gov.in"), v.trusted_domain("evil-gov.in.com"))
+PY
+rm -rf tools/__pycache__; ls -R tools .github | head
