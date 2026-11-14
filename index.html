@@ -260,5 +260,86 @@ function checkURL(){
   out.innerHTML=`${verdict}<br><span class="text-xs text-slate-500">${esc(h)}</span>${n.length?`<ul class="text-xs mt-1 list-disc ml-5">${n.map(x=>`<li>${esc(x)}</li>`).join("")}</ul>`:""}<p class="text-[11px] text-slate-500 mt-1">यह सिर्फ़ डोमेन की जाँच है, पेज की सामग्री की नहीं।</p>`;
 }
 </script>
-</body>
+</body>// Cloudflare Worker — "सत्य भारत" का AI सर्वर
+// API key कोड में नहीं, Worker के Secret में रहती है: ANTHROPIC_API_KEY
+
+const ALLOWED_ORIGIN = "https://kundankrishna666-lang.github.io"; // आपकी साइट
+const MODEL = "claude-sonnet-5-5"; // Anthropic console में मॉडल का नाम जाँच लें
+
+const SYSTEM = {
+  ask: `तुम "सत्य भारत" के सहायक हो। उपयोगकर्ता किसी भी विषय पर सवाल पूछ सकता है।
+- उसी भाषा में जवाब दो जिसमें सवाल है (हिंदी/हिंग्लिश/English)। भाषा बहुत सरल रखो, गाँव का आम पाठक भी समझे।
+- ताज़ा या बदलने वाली जानकारी के लिए web_search इस्तेमाल करो। सरकारी और आधिकारिक स्रोत को प्राथमिकता दो।
+- पहले 1-2 पंक्तियों में सीधा जवाब, फिर 3-5 छोटे बिंदु।
+- जो पक्का न पता हो, साफ़ कहो "पक्का नहीं"। कभी आँकड़ा या तारीख गढ़ो मत।
+- स्वास्थ्य, कानून या पैसे के मामलों में अंत में एक पंक्ति: विशेषज्ञ/आधिकारिक कार्यालय से पुष्टि करें।`,
+
+  verify: `उपयोगकर्ता ने कोई दावा या टेक्स्ट दिया है। web_search से आधिकारिक/भरोसेमंद स्रोत खोजकर जाँचो।
+पहली पंक्ति में फ़ैसला: "सही", "गलत", "आंशिक रूप से सही" या "पुष्टि नहीं हो सकी"।
+फिर बिंदुओं में कारण: कौन-सा हिस्सा सही, कौन-सा गलत, असली आँकड़ा/तारीख क्या है।
+सरल हिंदी में लिखो। स्रोत न मिले तो साफ़ कहो, अनुमान को तथ्य मत बताओ।`,
+
+  simplify: `नीचे दिया टेक्स्ट बहुत सरल हिंदी में समझाओ, ऐसे पाठक के लिए जो कम पढ़ा-लिखा है।
+ढाँचा: "मुख्य बात" (1-2 पंक्ति), "ज़रूरी बिंदु" (3-6 छोटे बिंदु), "कठिन शब्दों के अर्थ" (अगर हों)।
+मूल टेक्स्ट में जो नहीं है वह मत जोड़ो और कोई आँकड़ा मत बदलो।`
+};
+
+const json = (obj, status, cors) =>
+  new Response(JSON.stringify(obj), { status, headers: { ...cors, "Content-Type": "application/json" } });
+
+export default {
+  async fetch(req, env) {
+    const cors = {
+      "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+      "Vary": "Origin",
+    };
+    if (req.method === "OPTIONS") return new Response(null, { headers: cors });
+    if (req.method !== "POST") return json({ error: "POST only" }, 405, cors);
+    if (req.headers.get("Origin") !== ALLOWED_ORIGIN) return json({ error: "not allowed" }, 403, cors);
+
+    let b;
+    try { b = await req.json(); } catch { return json({ error: "bad json" }, 400, cors); }
+    const task = SYSTEM[b.task] ? b.task : "ask";
+    const text = String(b.text || "").trim().slice(0, 4000);
+    if (!text) return json({ error: "empty" }, 400, cors);
+
+    const body = {
+      model: MODEL,
+      max_tokens: 1000,
+      system: SYSTEM[task],
+      messages: [{ role: "user", content: text }],
+    };
+    if (task !== "simplify") {
+      body.tools = [{ type: "web_search_20250305", name: "web_search", max_uses: 3 }];
+    }
+
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok) return json({ error: d.error?.message || "AI error" }, 502, cors);
+
+    let answer = "";
+    const src = {};
+    for (const blk of d.content || []) {
+      if (blk.type === "text") {
+        answer += blk.text;
+        (blk.citations || []).forEach((c) => { if (c.url) src[c.url] = c.title || c.url; });
+      } else if (blk.type === "web_search_tool_result" && Array.isArray(blk.content)) {
+        blk.content.forEach((c) => { if (c.url && !src[c.url]) src[c.url] = c.title || c.url; });
+      }
+    }
+    const sources = Object.entries(src).slice(0, 6).map(([url, title]) => ({ url, title }));
+    return json({ answer: answer.trim(), sources }, 200, cors);
+  },
+};
+
 </html>
